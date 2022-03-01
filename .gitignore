@@ -1,2 +1,3 @@
 /.vscode/
 .env
+shared-local-instance.db
