@@ -1,13 +1,18 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/guregu/dynamo"
 	"github.com/joho/godotenv"
@@ -26,32 +31,41 @@ type UserConfig struct {
 	InteractiveFlag  int    `dynamo:"InteractiveFlag" localIndex:"index-2,range"`
 }
 
-const AWS_REGION = "ap-northeast-1"
-const DYNAMO_ENDPOINT = "http://localhost:8000"
+type Webhook struct {
+	Events []*linebot.Event `json:"events"`
+}
 
-func main() {
+func handler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	// TODO 消す
+	log.Print("Header", request.Headers)
+	log.Print("Body", request.Body)
+
+	if !validateSignature(os.Getenv("LINEBOT_SECRET_TOKEN"), request.Headers["x-line-signature"], []byte(request.Body)) {
+		return events.APIGatewayProxyResponse{
+			StatusCode: http.StatusBadRequest,
+			Body:       fmt.Sprintf(`{"message":"%s"}`+"\n", linebot.ErrInvalidSignature.Error()),
+		}, nil
+	}
+
+	var webhook Webhook
+
+	if err := json.Unmarshal([]byte(request.Body), &webhook); err != nil {
+		log.Print(err)
+		return events.APIGatewayProxyResponse{
+			StatusCode: http.StatusBadRequest,
+			Body:       fmt.Sprintf(`{"message":"%s"}`+"\n", http.StatusText(http.StatusBadRequest)),
+		}, nil
+	}
+
 	err := godotenv.Load(".env")
 
 	if err != nil {
 		log.Fatalf("Error loading env: %v", err)
 	}
 
-	sess, err := session.NewSession(&aws.Config{
-		Region:      aws.String(AWS_REGION),
-		Endpoint:    aws.String(DYNAMO_ENDPOINT),
-		Credentials: credentials.NewStaticCredentials("hoge", "huga", "hogehuga"),
+	db := dynamo.New(session.New(), &aws.Config{
+		Region: aws.String("ap-northeast-1"),
 	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	db := dynamo.New(sess)
-
-	db.Table("UserConfig").DeleteTable().Run()
-
-	err = db.CreateTable("UserConfig", UserConfig{}).Run()
-	if err != nil {
-		log.Print(err)
-	}
 
 	table := db.Table("UserConfig")
 
@@ -61,36 +75,56 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Setup HTTP Server for receiving requests from LINE platform
-	http.HandleFunc("/callback", func(w http.ResponseWriter, req *http.Request) {
-		events, err := bot.ParseRequest(req)
-		if err != nil {
-			if err == linebot.ErrInvalidSignature {
-				w.WriteHeader(400)
+	for _, event := range webhook.Events {
+		if event.Type == linebot.EventTypeMessage {
+			switch message := event.Message.(type) {
+			case *linebot.TextMessage:
+				sendReplyMessage(bot, event, message, table)
+			}
+		} else if event.Type == linebot.EventTypePostback {
+			if event.Postback.Data == "time" {
+				createTime(bot, event, table)
 			} else {
-				w.WriteHeader(500)
-			}
-			return
-		}
-		for _, event := range events {
-			if event.Type == linebot.EventTypeMessage {
-				switch message := event.Message.(type) {
-				case *linebot.TextMessage:
-					sendReplyMessage(bot, event, message, table)
-				}
-			} else if event.Type == linebot.EventTypePostback {
-				if event.Postback.Data == "time" {
-					createTime(bot, event, table)
-				} else {
-					createUserConfig(bot, event, table)
-				}
+				createUserConfig(bot, event, table)
 			}
 		}
-	})
-	// This is just sample code.
-	// For actual use, you must support HTTPS by using `ListenAndServeTLS`, a reverse proxy or something else.
-	if err := http.ListenAndServe(":"+os.Getenv("PORT"), nil); err != nil {
-		log.Fatal(err)
+	}
+
+	return events.APIGatewayProxyResponse{
+		StatusCode: 200,
+	}, nil
+}
+
+func validateSignature(channelSecret string, signature string, body []byte) bool {
+	decoded, err := base64.StdEncoding.DecodeString(signature)
+	if err != nil {
+		return false
+	}
+
+	hash := hmac.New(sha256.New, []byte(channelSecret))
+	_, err = hash.Write(body)
+	if err != nil {
+		return false
+	}
+
+	return hmac.Equal(decoded, hash.Sum(nil))
+}
+
+func sendReplyMessage(bot *linebot.Client, event *linebot.Event, message *linebot.TextMessage, table dynamo.Table) {
+	var user UserConfig
+	err := table.Get("UserID", event.Source.UserID).Range("InteractiveFlag", dynamo.Equal, 1).Index("index-2").One(&user)
+	if user.UserID != "" {
+		updateDayOfWeek(bot, event, message, user, table)
+	}
+	if err != nil {
+		log.Print(err)
+	}
+
+	if message.Text == "設定" {
+		bt, bt2 := makeButtonTemplate()
+		if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(configMessage), linebot.NewTemplateMessage("曜日ボタン", bt), linebot.NewTemplateMessage("曜日ボタン", bt2)).Do(); err != nil {
+			log.Print(err)
+		}
 	}
 }
 
@@ -150,24 +184,6 @@ func updateDayOfWeek(bot *linebot.Client, event *linebot.Event, message *linebot
 	sendTimeConfig(bot, event, message, user)
 }
 
-func sendReplyMessage(bot *linebot.Client, event *linebot.Event, message *linebot.TextMessage, table dynamo.Table) {
-	var user UserConfig
-	err := table.Get("UserID", event.Source.UserID).Range("InteractiveFlag", dynamo.Equal, 1).Index("index-2").One(&user)
-	if user.UserID != "" {
-		updateDayOfWeek(bot, event, message, user, table)
-	}
-	if err != nil {
-		log.Print(err)
-	}
-
-	if message.Text == "設定" {
-		bt, bt2 := makeButtonTemplate()
-		if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(configMessage), linebot.NewTemplateMessage("曜日ボタン", bt), linebot.NewTemplateMessage("曜日ボタン", bt2)).Do(); err != nil {
-			log.Print(err)
-		}
-	}
-}
-
 func makeButtonTemplate() (*linebot.ButtonsTemplate, *linebot.ButtonsTemplate) {
 	pas := []*linebot.PostbackAction{}
 	for _, wday := range wdays {
@@ -195,4 +211,8 @@ func makeButtonTemplate() (*linebot.ButtonsTemplate, *linebot.ButtonsTemplate) {
 	)
 
 	return bt, bt2
+}
+
+func main() {
+	lambda.Start(handler)
 }
