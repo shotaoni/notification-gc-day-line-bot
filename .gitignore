@@ -1,2 +1,7 @@
 /.vscode/
+
 .env
+shared-local-instance.db
+.serverless
+bin
+docker

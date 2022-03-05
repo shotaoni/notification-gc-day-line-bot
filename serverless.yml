@@ -1,0 +1,66 @@
+service: notification-gc-day-line-bot
+
+frameworkVersion: '>=1.58.0 <3.0.0'
+
+custom:
+  project_name: notification-gc-day-line-bot
+  dynamo_table_name: UserConfig
+
+provider:
+  name: aws
+  runtime: go1.x
+  region: ap-northeast-1
+  stackName: notification-gc-day-line-bot
+  timeout: 900
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - "dynamodb:*"
+      Resource: "*"
+    - Effect: Allow
+      Action:
+        - "logs:*"
+      Resource: "*"
+  environment:
+    LINEBOT_SECRET_TOKEN: ${opt:linebotSecretToken, ""}
+    LINEBOT_CHANNEL_ACCESS_TOKEN: ${opt:linebotChannelAccessToken, ""}
+
+functions:
+  webhook:
+    events:
+    - http:
+        method: post
+        path: /webhook
+    handler: bin/main
+    name: ${self:custom.project_name}-WebHook
+
+resources:
+  Resources:
+    ResourceTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: UserID
+            AttributeType: S
+          - AttributeName: DayOfWeek
+            AttributeType: S
+          - AttributeName: InteractiveFlag
+            AttributeType: N
+        KeySchema:
+          - AttributeName: UserID
+            KeyType: HASH
+          - AttributeName: DayOfWeek
+            KeyType: RANGE
+        ProvisionedThroughput:
+          ReadCapacityUnits: 1
+          WriteCapacityUnits: 1
+        LocalSecondaryIndexes:
+          - IndexName: index-2
+            KeySchema:
+              - AttributeName: UserID
+                KeyType: HASH
+              - AttributeName: InteractiveFlag
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        TableName: ${self:custom.dynamo_table_name}
