@@ -88,7 +88,6 @@ func handler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyRespo
 				createUserConfig(bot, event, table)
 			}
 		}
-
 	}
 
 	return events.APIGatewayProxyResponse{
