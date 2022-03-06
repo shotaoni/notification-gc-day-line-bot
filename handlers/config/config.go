@@ -12,28 +12,13 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/guregu/dynamo"
-	"github.com/joho/godotenv"
 	"github.com/line/line-bot-sdk-go/linebot"
+	"github.com/shotaoni/notification-gc-day-line-bot/bot"
+	"github.com/shotaoni/notification-gc-day-line-bot/db"
+	"github.com/shotaoni/notification-gc-day-line-bot/model"
+	"github.com/shotaoni/notification-gc-day-line-bot/utils"
 )
-
-var configMessage = "ゴミ捨て日の設定をするよ。 曜日を選択してね!"
-
-var wdays = [...]string{"日", "月", "火", "水", "木", "金", "土"}
-
-type UserConfig struct {
-	UserID           string `dynamo:"UserID,hash"`
-	DayOfWeek        string `dynamo:"DayOfWeek,range"`
-	Content          string `dynamo:"Content"`
-	NotificationTime string `dynamo:"NotificationTime"`
-	InteractiveFlag  int    `dynamo:"InteractiveFlag" localIndex:"index-2,range"`
-}
-
-type Webhook struct {
-	Events []*linebot.Event `json:"events"`
-}
 
 func handler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	// TODO 消す
@@ -47,29 +32,21 @@ func handler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyRespo
 		}, nil
 	}
 
-	var webhook Webhook
+	webhook := model.Webhook{}
 
 	if err := json.Unmarshal([]byte(request.Body), &webhook); err != nil {
-		log.Print(err)
 		return events.APIGatewayProxyResponse{
 			StatusCode: http.StatusBadRequest,
 			Body:       fmt.Sprintf(`{"message":"%s"}`+"\n", http.StatusText(http.StatusBadRequest)),
 		}, nil
 	}
 
-	err := godotenv.Load(".env")
-
+	table, err := db.ConnectTable("UserConfig")
 	if err != nil {
-		log.Fatalf("Error loading env: %v", err)
+		log.Fatal(err)
 	}
 
-	db := dynamo.New(session.New(), &aws.Config{
-		Region: aws.String("ap-northeast-1"),
-	})
-
-	table := db.Table("UserConfig")
-
-	bot, err := linebot.New(os.Getenv("LINEBOT_SECRET_TOKEN"), os.Getenv("LINEBOT_CHANNEL_ACCESS_TOKEN"))
+	bot, err := bot.NewLineBotClient()
 
 	if err != nil {
 		log.Fatal(err)
@@ -79,13 +56,13 @@ func handler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyRespo
 		if event.Type == linebot.EventTypeMessage {
 			switch message := event.Message.(type) {
 			case *linebot.TextMessage:
-				sendReplyMessage(bot, event, message, table)
+				sendReplyMessage(bot, event, message, *table)
 			}
 		} else if event.Type == linebot.EventTypePostback {
 			if event.Postback.Data == "time" {
-				createTime(bot, event, table)
+				createTime(bot, event, *table)
 			} else {
-				createUserConfig(bot, event, table)
+				createUserConfig(bot, event, *table)
 			}
 		}
 	}
@@ -111,10 +88,12 @@ func validateSignature(channelSecret string, signature string, body []byte) bool
 }
 
 func sendReplyMessage(bot *linebot.Client, event *linebot.Event, message *linebot.TextMessage, table dynamo.Table) {
-	var user UserConfig
+	user := model.UserConfig{}
+
 	err := table.Get("UserID", event.Source.UserID).Range("InteractiveFlag", dynamo.Equal, 1).Index("index-2").One(&user)
 	if user.UserID != "" {
 		updateDayOfWeek(bot, event, message, user, table)
+		return
 	}
 	if err != nil {
 		log.Print(err)
@@ -122,14 +101,19 @@ func sendReplyMessage(bot *linebot.Client, event *linebot.Event, message *linebo
 
 	if message.Text == "設定" {
 		bt, bt2 := makeButtonTemplate()
-		if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(configMessage), linebot.NewTemplateMessage("曜日ボタン", bt), linebot.NewTemplateMessage("曜日ボタン", bt2)).Do(); err != nil {
+		if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage("ゴミ捨て日の設定をするよ。 曜日を選択してね!"), linebot.NewTemplateMessage("曜日ボタン", bt), linebot.NewTemplateMessage("曜日ボタン", bt2)).Do(); err != nil {
+			log.Print(err)
+		}
+		return
+	} else {
+		if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(fmt.Sprintf("%s??ちょっと理解ができない言葉みたい...\n\n通知設定をしたい時は\"設定\"と入力してね!", message.Text))).Do(); err != nil {
 			log.Print(err)
 		}
 	}
 }
 
 func createTime(bot *linebot.Client, event *linebot.Event, table dynamo.Table) {
-	var user UserConfig
+	user := model.UserConfig{}
 	err := table.Get("UserID", event.Source.UserID).Range("InteractiveFlag", dynamo.Equal, 2).Index("index-2").One(&user)
 	if err != nil {
 		log.Fatal(err)
@@ -146,9 +130,9 @@ func createTime(bot *linebot.Client, event *linebot.Event, table dynamo.Table) {
 }
 
 func createUserConfig(bot *linebot.Client, event *linebot.Event, table dynamo.Table) {
-	var user UserConfig
+	user := model.UserConfig{}
 
-	err := table.Put(&UserConfig{UserID: event.Source.UserID, DayOfWeek: event.Postback.Data, InteractiveFlag: 1}).Run()
+	err := table.Put(model.UserConfig{UserID: event.Source.UserID, DayOfWeek: event.Postback.Data, InteractiveFlag: 1}).Run()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -164,7 +148,7 @@ func createUserConfig(bot *linebot.Client, event *linebot.Event, table dynamo.Ta
 
 }
 
-func sendTimeConfig(bot *linebot.Client, event *linebot.Event, message *linebot.TextMessage, user UserConfig) {
+func sendTimeConfig(bot *linebot.Client, event *linebot.Event, message *linebot.TextMessage, user model.UserConfig) {
 	time := linebot.NewButtonsTemplate(
 		"",
 		"通知時間を選択してね!",
@@ -176,7 +160,7 @@ func sendTimeConfig(bot *linebot.Client, event *linebot.Event, message *linebot.
 	}
 }
 
-func updateDayOfWeek(bot *linebot.Client, event *linebot.Event, message *linebot.TextMessage, user UserConfig, table dynamo.Table) {
+func updateDayOfWeek(bot *linebot.Client, event *linebot.Event, message *linebot.TextMessage, user model.UserConfig, table dynamo.Table) {
 	err := table.Update("UserID", event.Source.UserID).Range("DayOfWeek", user.DayOfWeek).Set("Content", message.Text).Set("InteractiveFlag", 2).Value(&user)
 	if err != nil {
 		log.Fatal(err)
@@ -186,7 +170,7 @@ func updateDayOfWeek(bot *linebot.Client, event *linebot.Event, message *linebot
 
 func makeButtonTemplate() (*linebot.ButtonsTemplate, *linebot.ButtonsTemplate) {
 	pas := []*linebot.PostbackAction{}
-	for _, wday := range wdays {
+	for _, wday := range utils.Wdays {
 		pas = append(pas, linebot.NewPostbackAction(wday, wday, "", ""))
 	}
 
