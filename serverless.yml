@@ -11,7 +11,7 @@ provider:
   runtime: go1.x
   region: ap-northeast-1
   stackName: notification-gc-day-line-bot
-  timeout: 900
+  timeout: 30
   iamRoleStatements:
     - Effect: "Allow"
       Action:
@@ -31,8 +31,13 @@ functions:
     - http:
         method: post
         path: /webhook
-    handler: bin/main
+    handler: bin/config
     name: ${self:custom.project_name}-WebHook
+  notification:
+    events:
+      - schedule: rate(1 minute)
+    handler: bin/notification
+    name: ${self:custom.project_name}-Notification
 
 resources:
   Resources:
@@ -44,6 +49,8 @@ resources:
             AttributeType: S
           - AttributeName: DayOfWeek
             AttributeType: S
+          - AttributeName: NotificationTime
+            AttributeType: S
           - AttributeName: InteractiveFlag
             AttributeType: N
         KeySchema:
@@ -54,6 +61,18 @@ resources:
         ProvisionedThroughput:
           ReadCapacityUnits: 1
           WriteCapacityUnits: 1
+        GlobalSecondaryIndexes:
+          - IndexName: index-3
+            KeySchema:
+              - AttributeName: NotificationTime
+                KeyType: HASH
+              - AttributeName: DayOfWeek
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+            ProvisionedThroughput:
+              ReadCapacityUnits: 1
+              WriteCapacityUnits: 1
         LocalSecondaryIndexes:
           - IndexName: index-2
             KeySchema:
