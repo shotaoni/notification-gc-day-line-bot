@@ -88,11 +88,19 @@ func validateSignature(channelSecret string, signature string, body []byte) bool
 }
 
 func sendReplyMessage(bot *linebot.Client, event *linebot.Event, message *linebot.TextMessage, table dynamo.Table) {
-	user := model.UserConfig{}
+	users := []model.UserConfig{}
 
-	err := table.Get("UserID", event.Source.UserID).Range("InteractiveFlag", dynamo.Equal, 1).Index("index-2").One(&user)
-	if user.UserID != "" {
-		updateDayOfWeek(bot, event, message, user, table)
+	err := table.Get("UserID", event.Source.UserID).Range("InteractiveFlag", dynamo.Equal, 1).Index("index-2").All(&users)
+
+	if (len(users)) > 0 {
+		// 複数ボタン押下対応
+		for _, u := range users {
+			err = table.Update("UserID", event.Source.UserID).Range("DayOfWeek", u.DayOfWeek).Set("InteractiveFlag", 0).Value(&u)
+			if err != nil {
+				log.Print(err)
+			}
+		}
+		updateDayOfWeek(bot, event, message, users[len(users)-1], table)
 		return
 	}
 	if err != nil {
