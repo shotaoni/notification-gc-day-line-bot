@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
@@ -59,17 +60,48 @@ func handler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyRespo
 				sendReplyMessage(bot, event, message, *table)
 			}
 		} else if event.Type == linebot.EventTypePostback {
-			if event.Postback.Data == "time" {
-				createTime(bot, event, *table)
-			} else {
-				createUserConfig(bot, event, *table)
-			}
+			replyMessageByPostBack(bot, event, *table)
 		}
 	}
 
 	return events.APIGatewayProxyResponse{
 		StatusCode: 200,
 	}, nil
+}
+
+func replyMessageByPostBack(bot *linebot.Client, event *linebot.Event, table dynamo.Table) {
+	dataMap := makeDataMap(event.Postback.Data)
+	log.Print(dataMap)
+	if dataMap["action"] == "deleteUserConfig" {
+		deleteUserConfig(bot, event, table, dataMap["dayOfWeek"])
+	} else if dataMap["action"] == "createUserConfig" {
+		createUserConfig(bot, event, table, dataMap["dayOfWeek"])
+	} else if dataMap["action"] == "createTime" {
+		createTime(bot, event, table)
+	}
+}
+
+func deleteUserConfig(bot *linebot.Client, event *linebot.Event, table dynamo.Table, dayOfWeek string) {
+	err := table.Delete("UserID", event.Source.UserID).Range("DayOfWeek", dayOfWeek).Run()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(fmt.Sprintf("%s曜日の通知を削除したよ!\n", dayOfWeek))).Do(); err != nil {
+		log.Print(err)
+	}
+}
+
+func makeDataMap(data string) map[string]string {
+	dataMap := make(map[string]string)
+
+	arr := strings.Split(data, "&")
+
+	for _, data := range arr {
+		splitedData := strings.Split(data, "=")
+		dataMap[splitedData[0]] = splitedData[1]
+	}
+	return dataMap
 }
 
 func validateSignature(channelSecret string, signature string, body []byte) bool {
@@ -87,19 +119,23 @@ func validateSignature(channelSecret string, signature string, body []byte) bool
 	return hmac.Equal(decoded, hash.Sum(nil))
 }
 
+func resetInteractiveFlag(userID string, users []model.UserConfig, table dynamo.Table) {
+	// 複数ボタン押下対応
+	for _, u := range users {
+		err := table.Update("UserID", userID).Range("DayOfWeek", u.DayOfWeek).Set("InteractiveFlag", 0).Value(&u)
+		if err != nil {
+			log.Print(err)
+		}
+	}
+}
+
 func sendReplyMessage(bot *linebot.Client, event *linebot.Event, message *linebot.TextMessage, table dynamo.Table) {
 	users := []model.UserConfig{}
 
 	err := table.Get("UserID", event.Source.UserID).Range("InteractiveFlag", dynamo.Equal, 1).Index("index-2").All(&users)
 
 	if (len(users)) > 0 {
-		// 複数ボタン押下対応
-		for _, u := range users {
-			err = table.Update("UserID", event.Source.UserID).Range("DayOfWeek", u.DayOfWeek).Set("InteractiveFlag", 0).Value(&u)
-			if err != nil {
-				log.Print(err)
-			}
-		}
+		resetInteractiveFlag(event.Source.UserID, users, table)
 		updateDayOfWeek(bot, event, message, users[len(users)-1], table)
 		return
 	}
@@ -107,14 +143,33 @@ func sendReplyMessage(bot *linebot.Client, event *linebot.Event, message *linebo
 		log.Print(err)
 	}
 
-	if message.Text == "設定" {
+	switch message.Text {
+	case "設定":
 		bt, bt2 := makeButtonTemplate()
 		if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage("ゴミ捨て日の設定をするよ。 曜日を選択してね!"), linebot.NewTemplateMessage("曜日ボタン", bt), linebot.NewTemplateMessage("曜日ボタン", bt2)).Do(); err != nil {
 			log.Print(err)
 		}
 		return
-	} else {
-		if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(fmt.Sprintf("%s??ちょっと理解ができない言葉みたい...\n\n通知設定をしたい時は\"設定\"と入力してね!", message.Text))).Do(); err != nil {
+	case "削除":
+		bt, bt2 := makeDeleteButtonTemplate(event.Source.UserID, table)
+		switch {
+		case bt == nil && bt2 == nil:
+			if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage("登録しているデータはないみたい!登録するときは\"設定\"と入力してね!")).Do(); err != nil {
+				log.Print(err)
+			}
+			return
+		case bt2 == nil:
+			if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage("ゴミ捨て日の通知削除をするよ。 削除したい曜日を選択してね!"), linebot.NewTemplateMessage("曜日ボタン", bt)).Do(); err != nil {
+				log.Print(err)
+			}
+			return
+		default:
+			if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage("ゴミ捨て日の通知削除をするよ。 削除したい曜日を選択してね!"), linebot.NewTemplateMessage("曜日ボタン", bt), linebot.NewTemplateMessage("曜日ボタン", bt2)).Do(); err != nil {
+				log.Print(err)
+			}
+		}
+	default:
+		if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(fmt.Sprintf("%s??ちょっと理解ができない言葉みたい...\n\n通知設定をしたい時は\"設定\"と入力、通知の削除をしたい時は\"削除\"と入力してね!", message.Text))).Do(); err != nil {
 			log.Print(err)
 		}
 	}
@@ -122,6 +177,7 @@ func sendReplyMessage(bot *linebot.Client, event *linebot.Event, message *linebo
 
 func createTime(bot *linebot.Client, event *linebot.Event, table dynamo.Table) {
 	user := model.UserConfig{}
+
 	err := table.Get("UserID", event.Source.UserID).Range("InteractiveFlag", dynamo.Equal, 2).Index("index-2").One(&user)
 	if err != nil {
 		log.Fatal(err)
@@ -137,20 +193,20 @@ func createTime(bot *linebot.Client, event *linebot.Event, table dynamo.Table) {
 	}
 }
 
-func createUserConfig(bot *linebot.Client, event *linebot.Event, table dynamo.Table) {
+func createUserConfig(bot *linebot.Client, event *linebot.Event, table dynamo.Table, dayOfWeek string) {
 	user := model.UserConfig{}
 
-	err := table.Put(model.UserConfig{UserID: event.Source.UserID, DayOfWeek: event.Postback.Data, InteractiveFlag: 1}).Run()
+	err := table.Put(model.UserConfig{UserID: event.Source.UserID, DayOfWeek: dayOfWeek, InteractiveFlag: 1}).Run()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	err = table.Get("UserID", event.Source.UserID).Range("DayOfWeek", dynamo.Equal, event.Postback.Data).One(&user)
+	err = table.Get("UserID", event.Source.UserID).Range("DayOfWeek", dynamo.Equal, dayOfWeek).One(&user)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(fmt.Sprintf("%s曜日は何ごみを捨てる日にする?\n\nメッセージで教えてね!", event.Postback.Data))).Do(); err != nil {
+	if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(fmt.Sprintf("%s曜日は何ごみを捨てる日にする?\n\nメッセージで教えてね!", dayOfWeek))).Do(); err != nil {
 		log.Print(err)
 	}
 
@@ -161,7 +217,7 @@ func sendTimeConfig(bot *linebot.Client, event *linebot.Event, message *linebot.
 		"",
 		"通知時間を選択してね!",
 		"00:00 ~ 23:59",
-		linebot.NewDatetimePickerAction("Time", "time", "time", "", "23:59", "00:00"),
+		linebot.NewDatetimePickerAction("Time", "action=createTime", "time", "", "23:59", "00:00"),
 	)
 	if _, err := bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(fmt.Sprintf("%s曜日に%sを通知するよ!\n\n何時に通知して欲しいか選んでね!", user.DayOfWeek, message.Text)), linebot.NewTemplateMessage("時間設定", time)).Do(); err != nil {
 		log.Print(err)
@@ -176,10 +232,66 @@ func updateDayOfWeek(bot *linebot.Client, event *linebot.Event, message *linebot
 	sendTimeConfig(bot, event, message, user)
 }
 
+func makeDeleteButtonTemplate(userID string, table dynamo.Table) (*linebot.ButtonsTemplate, *linebot.ButtonsTemplate) {
+	userConfigs := []model.UserConfig{}
+
+	err := table.Get("UserID", userID).All(&userConfigs)
+	if err != nil {
+		log.Fatal(err)
+		return nil, nil
+	}
+
+	pas := []*linebot.PostbackAction{}
+
+	for _, u := range userConfigs {
+		pas = append(pas, linebot.NewPostbackAction(u.DayOfWeek, fmt.Sprintf("action=deleteUserConfig&dayOfWeek=%s", u.DayOfWeek), "", ""))
+	}
+
+	var actions = make([]linebot.TemplateAction, 0)
+	for _, pa := range pas {
+		actions = append(actions, pa)
+	}
+
+	var bt *linebot.ButtonsTemplate
+	var bt2 *linebot.ButtonsTemplate
+
+	if len(actions) > 0 {
+		// actionは4つまで
+		i := 0
+		if len(actions) > 4 {
+			i = 4
+		} else {
+			i = len(actions)
+		}
+
+		bt = linebot.NewButtonsTemplate(
+			"",
+			"曜日を選択してね!",
+			"曜日選択",
+			actions[:i]...,
+		)
+	} else {
+		bt = nil
+	}
+
+	if len(actions) >= 5 {
+		bt2 = linebot.NewButtonsTemplate(
+			"",
+			"曜日を選択してね!",
+			"曜日選択",
+			actions[4:]...,
+		)
+	} else {
+		bt2 = nil
+	}
+	return bt, bt2
+
+}
+
 func makeButtonTemplate() (*linebot.ButtonsTemplate, *linebot.ButtonsTemplate) {
 	pas := []*linebot.PostbackAction{}
 	for _, wday := range utils.Wdays {
-		pas = append(pas, linebot.NewPostbackAction(wday, wday, "", ""))
+		pas = append(pas, linebot.NewPostbackAction(wday, fmt.Sprintf("action=createUserConfig&dayOfWeek=%s", wday), "", ""))
 	}
 
 	var actions = make([]linebot.TemplateAction, 0)
